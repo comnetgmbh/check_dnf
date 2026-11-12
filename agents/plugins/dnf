@@ -5,7 +5,7 @@
 #          and yum plugins (yum-plugin-versionlock), not only dnf5.
 # ---------------------------------------------------------------------------
 
-CMK_VERSION="2.4.3"
+CMK_VERSION="2.4.4"
 
 if [ -z "$MK_VARDIR" ]; then
     echo "ERROR: Unable to load ENV variables"
