@@ -1,5 +1,9 @@
 #!/bin/bash
 # Set the version to be captured in newer versions of CheckMK Inventory
+# ---------------------------------------------------------------------------
+# 2026-11: versionlock support for dnf4 plugins (python3-dnf-plugin-versionlock)
+#          and yum plugins (yum-plugin-versionlock), not only dnf5.
+# ---------------------------------------------------------------------------
 
 CMK_VERSION="2.4.3"
 
@@ -20,7 +24,7 @@ LAST_UPDATE_TIMESTAMP=-1
 if [ -f "/etc/os-release" ]; then
   # Read required fields
   . /etc/os-release
-  
+
   # Extract major version
   MAJOR_VERSION=$(echo "$VERSION_ID" | cut -d. -f1)
 
@@ -80,6 +84,135 @@ else
     echo "ERROR: No supported package manager found (yum, dnf, or dnf5)"
     exit 2
 fi
+
+# ===========================================================================
+# versionlock helpers
+#
+#   dnf5 : "versionlock" is a built in command.  "dnf5 versionlock list"
+#          prints blocks beginning with "Package name: <name>".
+#   dnf4 : versionlock is a plugin (python3-dnf-plugin-versionlock /
+#          dnf-plugins-core).  The command only exists if that plugin is
+#          installed; it prints the raw locklist entries, e.g.
+#          "bash-0:4.2.46-34.el7.*"
+#   yum  : versionlock is a plugin (yum-plugin-versionlock) and writes
+#          "0:bash-4.2.46-34.el7.*"  (epoch first!)
+#
+# Neither "--noplugins" (used for the update queries below) nor the
+# non-transactional "list" command applies the versionlock excludes, so
+# locked packages appear as ordinary pending updates.  They are therefore
+# removed from the update list by *name* - that is also correct for dnf5,
+# where "list" does not apply the locks either.
+# ===========================================================================
+VL_INSTALLED=""     # "name EPOCH:VERSION-RELEASE" of all installed packages
+VL_SPECS=""         # raw versionlock entries
+VL_LOCKED=""        # package names of version locked packages
+VL_EXCLUDED=""      # package names of "versionlock exclude" entries (!...)
+
+# print the locklist file configured in versionlock.conf (dnf4 / yum)
+versionlock_file() {
+    case "$PKG_MGR" in
+        dnf) _vl_conf="/etc/dnf/plugins/versionlock.conf"
+             _vl_default="/etc/dnf/plugins/versionlock.list" ;;
+        yum) _vl_conf="/etc/yum/pluginconf.d/versionlock.conf"
+             _vl_default="/etc/yum/pluginconf.d/versionlock.list" ;;
+        *)   return 1 ;;
+    esac
+
+    if [ -r "$_vl_conf" ]; then
+        _vl_f=$(sed -n 's/^[[:space:]]*locklist[[:space:]]*=[[:space:]]*//p' "$_vl_conf" | tail -n1)
+        _vl_f=$(printf '%s' "$_vl_f" | tr -d '"' | tr -d "'" \
+                | sed -e 's/[[:space:]]*$//' -e 's/^file://')
+        if [ -n "$_vl_f" ]; then
+            printf '%s\n' "$_vl_f"
+            return 0
+        fi
+    fi
+
+    [ -r "$_vl_default" ] && { printf '%s\n' "$_vl_default"; return 0; }
+    return 1
+}
+
+# print all raw versionlock entries, one per line (empty if unavailable)
+versionlock_specs() {
+    # plugin disabled in its own config -> no locks are applied at all
+    case "$PKG_MGR" in
+        dnf) _vl_conf="/etc/dnf/plugins/versionlock.conf" ;;
+        yum) _vl_conf="/etc/yum/pluginconf.d/versionlock.conf" ;;
+        *)   _vl_conf="" ;;
+    esac
+    if [ -n "$_vl_conf" ] && [ -r "$_vl_conf" ] && \
+       grep -Eqi '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*(0|false|no)' "$_vl_conf"; then
+        return 0
+    fi
+
+    case "$PKG_MGR" in
+        dnf5)
+            dnf5 versionlock list 2>/dev/null | sed -n 's/^Package name:[[:space:]]*//p'
+            ;;
+        dnf|yum)
+            _vl_out=$($PKG_MGR -C --quiet versionlock list 2>/dev/null \
+                      | grep -Ev '^(Last metadata|Loaded plugins|Available packages|No such command)')
+            if [ -z "$_vl_out" ]; then
+                # e.g. empty metadata cache -> "-C" fails; read the locklist file
+                _vl_file=$(versionlock_file) && [ -r "$_vl_file" ] && \
+                    _vl_out=$(sed -e 's/#.*//' "$_vl_file" | grep -Ev '^[[:space:]]*$')
+                # versionlock command missing entirely -> no versionlock plugin
+                dnf="$PKG_MGR"
+            fi
+            printf '%s\n' "$_vl_out"
+            ;;
+    esac
+}
+
+# resolve one versionlock entry to a package name
+#   $1 = "name-0:1.2-3.*" (dnf4), "0:name-1.2-3.*" (yum) or "name" (dnf5)
+# prints nothing if it cannot be resolved
+spec_to_name() {
+    _spec="${1#!}"          # strip the '!' of "versionlock exclude" entries
+    _spec="${_spec%.\*}"    # strip the trailing ".*" written by the plugins
+    _spec="${_spec%\*}"     # strip a trailing "*"
+    [ -n "$_spec" ] || return 0
+
+    # 1st pass: exact match against the installed packages (plain names and
+    # fully qualified locks)
+    while read -r _n _e; do
+        [ -n "$_n" ] || continue
+        _e="${_e/#\(none\)/0}"
+        if [ "$_spec" = "$_n" ] ||
+           [ "$_spec" = "$_n-$_e" ] ||
+           [ "$_spec" = "$_n-${_e#*:}" ] ||
+           [ "$_spec" = "${_e%%:*}:$_n-${_e#*:}" ]; then
+            printf '%s\n' "$_n"
+            return 0
+        fi
+    done <<EOF
+$VL_INSTALLED
+EOF
+
+    # 2nd pass: entries containing wildcards (e.g. "kernel-0:5.14.0-427.*").
+    # The package name is part of the entry, so a prefix match is unambiguous.
+    while read -r _n _e; do
+        [ -n "$_n" ] || continue
+        _e="${_e/#\(none\)/0}"
+        case "$_n-$_e"               in $_spec*) printf '%s\n' "$_n"; return 0 ;; esac
+        case "$_n-${_e#*:}"          in $_spec*) printf '%s\n' "$_n"; return 0 ;; esac
+        case "${_e%%:*}:$_n-${_e#*:}" in $_spec*) printf '%s\n' "$_n"; return 0 ;; esac
+    done <<EOF
+$VL_INSTALLED
+EOF
+
+    # 3rd pass: the locked version is not installed (lock on a newer version or
+    # on a package that is only available in the repos) -> derive the name
+    # from the list of pending updates, longest match wins
+    _hit=""
+    for _u in $UPDATES_LIST; do
+        case "$_spec" in
+            "$_u"|"$_u"-*|*:"$_u"-*) [ ${#_u} -gt ${#_hit} ] && _hit="$_u" ;;
+        esac
+    done
+    [ -n "$_hit" ] && printf '%s\n' "$_hit"
+    return 0
+}
 
 # check if cached listing of /var/cache/yum already exists - create empty one otherwise
 if [ ! -e "$CACHE_YUM_UPDATE" ]
@@ -168,21 +301,55 @@ then
         fi
     fi
 
-    # Count available updates - different commands for different package managers
+    # Collect the names of all pending updates (one package name per line)
     if [ "$PKG_MGR" = "dnf5" ]; then
-        LOCKED=$(dnf5 versionlock list | grep -o -P '(?<=^Package name: ).+' | tr '\n' ' ')
-        if [[ -n "$LOCKED" ]]; then
-            LOCKED="version locked: $LOCKED"
-            LOCKEDNR=$(dnf5 versionlock list | grep -c -o -P '(?<=^Package name: ).+')
-        else
-            let LOCKEDNR=0
-        fi
-        UPDATES=$(timeout 25s dnf5 list --upgrades 2>/dev/null | grep -E "^[a-zA-Z]" | tail -n +2 | wc -l || echo "-1")
-        let UPDATES=UPDATES-LOCKEDNR
+        UPDATES_LIST=$(timeout 25s dnf5 list --upgrades 2>/dev/null \
+                       | grep -E "^[a-zA-Z]" | tail -n +2 | awk '{print $1}' \
+                       | sed 's/\.[^.]*$//' | sort -u)
     else
-        LOCKED=""
-        UPDATES=$(timeout 25s $PKG_MGR -C --noplugins --quiet list updates 2>/dev/null | grep "\." | cut -d' ' -f1 | wc -l || echo "-1")
+        UPDATES_LIST=$(timeout 25s $PKG_MGR -C --noplugins --quiet list updates 2>/dev/null \
+                       | grep "\." | cut -d' ' -f1 \
+                       | sed 's/\.[^.]*$//' | sort -u)
     fi
+
+    # Collect versionlocked packages (dnf5, dnf4 plugin and yum plugin)
+    VL_LOCKED=""
+    VL_EXCLUDED=""
+    VL_SPECS=$(versionlock_specs)
+    if [ -n "$VL_SPECS" ]; then
+        # index of installed packages: "name EPOCH:VERSION-RELEASE"
+        VL_INSTALLED=$(rpm -qa --qf '%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\n' 2>/dev/null)
+        while IFS= read -r _spec; do
+            [ -n "$_spec" ] || continue
+            _name=$(spec_to_name "$_spec")
+            [ -n "$_name" ] || continue
+            case "$_spec" in
+                '!'*) VL_EXCLUDED="$VL_EXCLUDED $_name" ;;
+                *)    VL_LOCKED="$VL_LOCKED $_name" ;;
+            esac
+        done <<EOF
+$VL_SPECS
+EOF
+        # unique, space separated, no leading/trailing blank lines
+        VL_LOCKED=$(printf '%s\n' $VL_LOCKED | grep -Ev '^$' | sort -u | tr '\n' ' ')
+        VL_EXCLUDED=$(printf '%s\n' $VL_EXCLUDED | grep -Ev '^$' | sort -u | tr '\n' ' ')
+    fi
+
+    # Count available updates, ignoring locked (and excluded) packages
+    if [ -n "$UPDATES_LIST" ]; then
+        UPDATES=$(printf '%s\n' "$UPDATES_LIST" | awk -v locked="$VL_LOCKED $VL_EXCLUDED" '
+            BEGIN { n = split(locked, a, " ")
+                    for (i = 1; i <= n; i++) if (a[i] != "") skip[a[i]] = 1 }
+            NF && !($1 in skip) { c++ }
+            END { print c + 0 }')
+    else
+        UPDATES=0
+    fi
+
+    LOCKED=""
+    [ -n "$VL_LOCKED" ]   && LOCKED="version locked: $VL_LOCKED"
+    [ -n "$VL_EXCLUDED" ] && LOCKED="$LOCKED excluded: $VL_EXCLUDED"
+    LOCKED="${LOCKED% }"
 
     # Check for security updates if supported
     if [ $SECURITY_SUPPORTED -eq 1 ]; then
@@ -231,7 +398,7 @@ then
     fi
 
     # Add check in case this is a brand new built machine
-    if [ "$LAST_UPDATE_TIMESTAMP" = "" ]; then 
+    if [ "$LAST_UPDATE_TIMESTAMP" = "" ]; then
         LAST_UPDATE_TIMESTAMP=-1
     fi
 
